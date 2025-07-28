@@ -59,6 +59,10 @@ from transformer_engine.pytorch.attention.dot_product_attention.utils import (
 from transformer_engine.pytorch import export
 from transformer_engine.pytorch.export import is_in_onnx_export_mode
 
+
+import torchgraph as tg
+FORCE_CP_WHEN_SIZE_IS_ONE = os.getenv('FORCE_CP_WHEN_SIZE_IS_ONE', '0') == '1'
+
 # Global vars for flash attn v2 and v3 imports
 flash_attn_cuda_bwd = None
 flash_attn_func = None
@@ -509,7 +513,7 @@ class FlashAttention(torch.nn.Module):
         elif isinstance(cp_group, list):
             for group in cp_group:
                 cp_size *= get_distributed_world_size(group)
-        context_parallel = cp_size > 1
+        context_parallel = FORCE_CP_WHEN_SIZE_IS_ONE or cp_size > 1
 
         # get q_format and kv_format for training and inference
         qkv_format, q_format, kv_format = dpa_utils.get_qkv_format(qkv_layout, inference_params)
@@ -1475,7 +1479,7 @@ class FusedAttention(torch.nn.Module):
         elif isinstance(cp_group, list):
             for group in cp_group:
                 cp_size *= get_distributed_world_size(group)
-        context_parallel = cp_size > 1
+        context_parallel = tg.HACK_FOR_DYNAMO or cp_size > 1
 
         # get q_format and kv_format for training and inference
         qkv_format, q_format, kv_format = dpa_utils.get_qkv_format(qkv_layout, inference_params)

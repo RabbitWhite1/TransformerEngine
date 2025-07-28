@@ -53,7 +53,6 @@ def torch_onnx_gemm_inf_op(
     weight: torch.Tensor, inp: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
     """Gemm used for inference -- weight is transposed"""
-    raise RuntimeError("!!!")
     out = inp @ weight.T
     if bias is not None:
         out = out + bias

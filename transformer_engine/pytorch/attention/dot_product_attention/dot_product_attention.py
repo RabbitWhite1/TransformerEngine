@@ -50,6 +50,7 @@ from transformer_engine.pytorch.attention.dot_product_attention.backends import 
 import contextlib
 from .utils import FlashAttentionUtils
 import torchgraph as tg
+FORCE_CP_WHEN_SIZE_IS_ONE = os.getenv('FORCE_CP_WHEN_SIZE_IS_ONE', '0') == '1'
 
 
 # Setup Attention Logging
@@ -846,7 +847,7 @@ class DotProductAttention(TransformerEngineBaseModule):
             elif isinstance(self.cp_group, list):
                 for group in self.cp_group:
                     cp_size *= get_distributed_world_size(group)
-            context_parallel = cp_size > 1
+            context_parallel = FORCE_CP_WHEN_SIZE_IS_ONE or cp_size > 1
             if q_format in ["sbhd", "bshd"]:
                 max_seqlen_q *= cp_size
                 if cu_seqlens_q is None:

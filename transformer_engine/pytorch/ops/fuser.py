@@ -30,6 +30,7 @@ from transformer_engine.pytorch.tensor.quantized_tensor import (
     restore_from_saved,
 )
 
+from ..export import is_in_onnx_export_mode
 
 def _split_tuple(t: tuple, idx: int) -> tuple[tuple, tuple]:
     """Split tuple at index"""
@@ -100,8 +101,9 @@ class _OperationFuserAutogradFunction(torch.autograd.Function):
         basic_op_ctxs = [OperationContext() for _ in range(fuser._num_basic_ops)]
 
         # Mark input tensors as not deletable in backward
-        for tensor in (input_,) + params_and_extra_inputs:
-            tensor.do_not_clear = True
+        if not is_in_onnx_export_mode():  # onnx mode doesn't support backward at all.
+            for tensor in (input_,) + params_and_extra_inputs:
+                tensor.do_not_clear = True
 
         # Unflatten list of parameters and extra tensor inputs
         extra_inputs = params_and_extra_inputs[-fuser.num_extra_inputs :]
@@ -116,6 +118,7 @@ class _OperationFuserAutogradFunction(torch.autograd.Function):
         is_grad_enabled = func_ctx is not None
 
         # Attempt to fuse operations if neccesary
+        # if not is_in_onnx_export_mode():  # dynamo will have trouble handling some of the codes.
         fuser.maybe_fuse_ops(is_grad_enabled, recipe, input_, basic_op_extra_inputs)
 
         # Apply forward ops
@@ -257,6 +260,7 @@ class _OperationFuserAutogradFunction(torch.autograd.Function):
 
             # Backward op
             grad_extra_outputs = [basic_op_grad_extra_outputs[idx] for idx in basic_op_idxs]
+            print(f"{op=}, {grad_output.shape=}")
             dx, fused_op_grad_params, fused_op_grad_extra_inputs = op.fuser_backward(
                 [basic_op_ctxs[idx] for idx in basic_op_idxs],
                 dx,

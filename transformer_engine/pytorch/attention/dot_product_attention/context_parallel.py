@@ -43,6 +43,10 @@ from transformer_engine.pytorch.attention.dot_product_attention.utils import (
     FlashAttentionUtils as fa_utils,
 )
 
+
+import contextlib
+import torchgraph as tg
+
 _cu_seqlens_info_with_cp_cache = {}
 _seq_chunk_ids_cache_for_reordering_before_attn = {}
 _seq_chunk_ids_cache_for_reordering_after_attn = {}
@@ -195,14 +199,21 @@ def get_seq_chunk_ids_for_reordering_before_attn(cp_size, device):
     be contigupus before attention compute. This function is to compute sequence chunk ids for
     reordering.
     """
-    global _seq_chunk_ids_cache_for_reordering_before_attn
-    if (cp_size, device) not in _seq_chunk_ids_cache_for_reordering_before_attn:
+    if tg.HACK_FOR_DYNAMO:
         chunk_ids = torch.empty(2 * cp_size, dtype=torch.int32, device=device)
         for rank in range(cp_size):
             chunk_ids[rank] = 2 * rank
             chunk_ids[rank + cp_size] = 2 * cp_size - 2 * rank - 1
-        _seq_chunk_ids_cache_for_reordering_before_attn[(cp_size, device)] = chunk_ids
-    return _seq_chunk_ids_cache_for_reordering_before_attn[(cp_size, device)]
+        return chunk_ids
+    else:
+        global _seq_chunk_ids_cache_for_reordering_before_attn
+        if (cp_size, device) not in _seq_chunk_ids_cache_for_reordering_before_attn:
+            chunk_ids = torch.empty(2 * cp_size, dtype=torch.int32, device=device)
+            for rank in range(cp_size):
+                chunk_ids[rank] = 2 * rank
+                chunk_ids[rank + cp_size] = 2 * cp_size - 2 * rank - 1
+            _seq_chunk_ids_cache_for_reordering_before_attn[(cp_size, device)] = chunk_ids
+        return _seq_chunk_ids_cache_for_reordering_before_attn[(cp_size, device)]
 
 
 @jit_fuser
@@ -212,14 +223,21 @@ def get_seq_chunk_ids_for_reordering_after_attn(cp_size, device):
     We need to reorder sequence chunks back to discontiguous after attention compute. This function
     is to compute sequence chunk ids for reordering.
     """
-    global _seq_chunk_ids_cache_for_reordering_after_attn
-    if (cp_size, device) not in _seq_chunk_ids_cache_for_reordering_after_attn:
+    if tg.HACK_FOR_DYNAMO:
         chunk_ids = torch.empty(2 * cp_size, dtype=torch.int32, device=device)
         for rank in range(cp_size):
             chunk_ids[2 * rank] = rank
             chunk_ids[2 * rank + 1] = 2 * cp_size - rank - 1
-        _seq_chunk_ids_cache_for_reordering_after_attn[(cp_size, device)] = chunk_ids
-    return _seq_chunk_ids_cache_for_reordering_after_attn[(cp_size, device)]
+        return chunk_ids
+    else:
+        global _seq_chunk_ids_cache_for_reordering_after_attn
+        if (cp_size, device) not in _seq_chunk_ids_cache_for_reordering_after_attn:
+            chunk_ids = torch.empty(2 * cp_size, dtype=torch.int32, device=device)
+            for rank in range(cp_size):
+                chunk_ids[2 * rank] = rank
+                chunk_ids[2 * rank + 1] = 2 * cp_size - rank - 1
+            _seq_chunk_ids_cache_for_reordering_after_attn[(cp_size, device)] = chunk_ids
+        return _seq_chunk_ids_cache_for_reordering_after_attn[(cp_size, device)]
 
 
 @jit_fuser
@@ -2819,10 +2837,11 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
         # [cp*2, s//2, b, np, hn] -> [cp*s, b, np, hn]
         k_ag = k_ag.view(-1, *k.shape[1:])
         v_ag = v_ag.view(-1, *v.shape[1:])
-        cp_stream.wait_stream(torch.cuda.current_stream())
+        if not tg.HACK_FOR_DYNAMO:
+            cp_stream.wait_stream(torch.cuda.current_stream())
 
-        # create two streams to resolve wave quantization issue of Flash Attn in each step
-        flash_attn_streams = [torch.cuda.current_stream(), cp_stream]
+            # create two streams to resolve wave quantization issue of Flash Attn in each step
+            flash_attn_streams = [torch.cuda.current_stream(), cp_stream]
 
         local_seq_chunk_ids = [rank, 2 * cp_size - rank - 1]
         kv_seq_range_per_step = [None, None]
@@ -2835,7 +2854,11 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
 
         for i in range(len(local_seq_chunk_ids) + 1):
             if i < len(local_seq_chunk_ids):
-                with torch.cuda.stream(flash_attn_streams[i]):
+                if not tg.HACK_FOR_DYNAMO:
+                    stream_context = torch.cuda.stream(flash_attn_streams[i])
+                else:
+                    stream_context = contextlib.nullcontext()
+                with stream_context:
                     # [b, 2, sq//2, np, hn] -> [b, sq//2, np, hn]
                     # or [2, sq//2, b, np, hn] -> [sq//2, b, np, hn]
                     q_ = q.select(seq_dim, i).contiguous()
@@ -2918,13 +2941,18 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
                                 rng_states[i] = fa_outputs[3]
 
             if i > 0:
-                with torch.cuda.stream(flash_attn_streams[i - 1]):
+                if not tg.HACK_FOR_DYNAMO:
+                    stream_context = torch.cuda.stream(flash_attn_streams[i - 1])
+                else:
+                    stream_context = contextlib.nullcontext()
+                with stream_context:
                     if qkv_format == "bshd":
                         out[:, i - 1].copy_(out_per_step[i - 1])
                     elif qkv_format == "sbhd":
                         out[i - 1].copy_(out_per_step[i - 1])
 
-        torch.cuda.current_stream().wait_stream(cp_stream)
+        if not tg.HACK_FOR_DYNAMO:
+            torch.cuda.current_stream().wait_stream(cp_stream)
 
         if use_fused_attention:
             if qkv_format == "bshd":
@@ -2950,7 +2978,8 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
         ctx.kv_seq_range_per_step = kv_seq_range_per_step
         ctx.window_size_per_step = window_size_per_step
         ctx.cp_group = cp_group
-        ctx.cp_stream = cp_stream
+        if not tg.HACK_FOR_DYNAMO:
+            ctx.cp_stream = cp_stream
         ctx.dropout_p = dropout_p
         ctx.max_seqlen_q = max_seqlen_q
         ctx.softmax_scale = softmax_scale
@@ -2990,8 +3019,9 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
         dk_per_step = [None, None]
         dv_per_step = [None, None]
 
-        # create two streams to resolve wave quantization issue of Flash Attn in each step
-        flash_attn_streams = [torch.cuda.current_stream(), ctx.cp_stream]
+        if not tg.HACK_FOR_DYNAMO:
+            # create two streams to resolve wave quantization issue of Flash Attn in each step
+            flash_attn_streams = [torch.cuda.current_stream(), ctx.cp_stream]
         # synchronize dkv update across steps
         dkv_update_done = torch.cuda.Event()
 
@@ -3008,7 +3038,8 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
         # [cp*2, s//2, b, np, hn] -> [cp*s, b, np, hn]
         k_ag = k_ag.view(-1, *k.shape[1:])
         v_ag = v_ag.view(-1, *v.shape[1:])
-        ctx.cp_stream.wait_stream(torch.cuda.current_stream())
+        if not tg.HACK_FOR_DYNAMO:
+            ctx.cp_stream.wait_stream(torch.cuda.current_stream())
 
         local_seq_chunk_ids = [rank, 2 * cp_size - rank - 1]
 
@@ -3045,7 +3076,11 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
 
         for i in range(len(local_seq_chunk_ids) + 1):
             if i < len(local_seq_chunk_ids):
-                with torch.cuda.stream(flash_attn_streams[i]):
+                if not tg.HACK_FOR_DYNAMO:
+                    stream_context = torch.cuda.stream(flash_attn_streams[i])
+                else:
+                    stream_context = contextlib.nullcontext()
+                with stream_context:
                     # [b, 2, sq//2, np, hn] -> [b, sq//2, np, hn]
                     # or [2, sq//2, b, np, hn] -> [sq//2, b, np, hn]
                     q_ = q.select(seq_dim, i).contiguous()
@@ -3123,7 +3158,11 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
                         )
 
             if i > 0:
-                with torch.cuda.stream(flash_attn_streams[i - 1]):
+                if not tg.HACK_FOR_DYNAMO:
+                    stream_context = torch.cuda.stream(flash_attn_streams[i - 1])
+                else:
+                    stream_context = contextlib.nullcontext()
+                with stream_context:
                     if ctx.qkv_format == "bshd":
                         dq[:, i - 1].copy_(dq_per_step[i - 1])
                     elif ctx.qkv_format == "sbhd":
@@ -3134,18 +3173,20 @@ class AttnFuncWithCPAndKVAllGather(torch.autograd.Function):
                         for x in [dk_per_step[i - 1], dv_per_step[i - 1]]
                     ]
                     # wait until dkv update of last step is done
-                    if i > 1:
-                        flash_attn_streams[i - 1].wait_event(dkv_update_done)
+                    if not tg.HACK_FOR_DYNAMO:
+                        if i > 1:
+                            flash_attn_streams[i - 1].wait_event(dkv_update_done)
                     seq_start_idx, seq_end_idx = (
                         kv_seq_range_per_step[i - 1][0],
                         kv_seq_range_per_step[i - 1][1],
                     )
                     dk[seq_start_idx:seq_end_idx].add_(dk_per_step[i - 1])
                     dv[seq_start_idx:seq_end_idx].add_(dv_per_step[i - 1])
-                    if i < len(local_seq_chunk_ids):
-                        flash_attn_streams[i - 1].record_event(dkv_update_done)
-
-        torch.cuda.current_stream().wait_stream(ctx.cp_stream)
+                    if not tg.HACK_FOR_DYNAMO:
+                        if i < len(local_seq_chunk_ids):
+                            flash_attn_streams[i - 1].record_event(dkv_update_done)
+        if not tg.HACK_FOR_DYNAMO:
+            torch.cuda.current_stream().wait_stream(ctx.cp_stream)
 
         # [cp*s, b, np, hn] -> [cp*2, s//2, b, np, hn]
         dk = dk.view(2 * cp_size, -1, *dk.shape[-3:])
@@ -3918,7 +3959,10 @@ def attn_forward_func_with_cp(
     elif cp_comm_type == "all_gather":
         args.pop(5)
         args.pop(8)
-        args += [window_size, cp_group, cp_stream, use_flash_attn_3]
+        if tg.HACK_FOR_DYNAMO:
+            args += [window_size, cp_group, None, use_flash_attn_3]
+        else:
+            args += [window_size, cp_group, cp_stream, use_flash_attn_3]
         out = AttnFuncWithCPAndKVAllGather.apply(*args)
     elif cp_comm_type == "a2a":
         args += [window_size, fp8, fp8_meta, cp_group, cp_stream, quantizers, use_flash_attn_3]

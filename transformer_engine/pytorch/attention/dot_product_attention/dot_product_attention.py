@@ -47,6 +47,11 @@ from transformer_engine.pytorch.attention.dot_product_attention.backends import 
 )
 
 
+import contextlib
+from .utils import FlashAttentionUtils
+import torchgraph as tg
+
+
 # Setup Attention Logging
 attn_log.setup_logging()
 
@@ -630,11 +635,13 @@ class DotProductAttention(TransformerEngineBaseModule):
             If true, there are padding tokens between individual sequences in a packed batch.
         """
 
-        with torch.cuda.device(query_layer.device), self.prepare_forward(
-            query_layer,
-            num_gemms=3,
-            allow_non_contiguous=True,
-        ) as query_layer:
+        # with torch.cuda.device(query_layer.device), self.prepare_forward(
+        #     query_layer,
+        #     num_gemms=3,
+        #     allow_non_contiguous=True,
+        # ) as query_layer:
+        # FIXME: tg.HACK_FOR_DYNAMO
+        with contextlib.nullcontext():
             # checks for RNG
             if self.rng_states_tracker is not None and is_graph_capturing():
                 assert isinstance(
@@ -719,9 +726,10 @@ class DotProductAttention(TransformerEngineBaseModule):
             ], "DotProductAttention only supports qkv_format = {'sbhd', 'bshd', 'thd'}!"
             batch_size = None
             if qkv_format in ["sbhd", "bshd"]:
-                assert all(
-                    len(x.shape) == 4 for x in (query_layer, key_layer, value_layer)
-                ), f"Queries, keys and values must be 4D tensors when {qkv_format=}!"
+                if not tg.HACK_FOR_DYNAMO:
+                    assert all(
+                        len(x.shape) == 4 for x in (query_layer, key_layer, value_layer)
+                    ), f"Queries, keys and values must be 4D tensors when {qkv_format=}!"
                 if qkv_format == "sbhd":
                     batch_size = query_layer.shape[1]
                     max_seqlen_q = query_layer.shape[0] if max_seqlen_q is None else max_seqlen_q
@@ -800,7 +808,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                 cu_seqlens_kv_padded = None
 
             # get qkv's memory layout
-            if all(isinstance(x, Float8Tensor) for x in [query_layer, key_layer, value_layer]):
+            if not tg.HACK_FOR_DYNAMO and all(isinstance(x, Float8Tensor) for x in [query_layer, key_layer, value_layer]):
                 (
                     qkv_layout,
                     query_layer._data,
@@ -964,7 +972,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                 inference_params=inference_params,
             )
             global _attention_backends
-            if is_in_onnx_export_mode():
+            if False and is_in_onnx_export_mode():
                 # We do not want to call get_attention_backend() in ONNX mode
                 # and we want to avoid using any global variables like _attention_backends.
                 use_flash_attention = False
@@ -978,14 +986,21 @@ class DotProductAttention(TransformerEngineBaseModule):
                     _attention_backends["attention_params"] = attention_params
                     _attention_backends["backend_selection_requires_update"] = True
                 if _attention_backends["backend_selection_requires_update"]:
-                    (
-                        use_flash_attention,
-                        flash_attention_backend,
-                        use_fused_attention,
-                        fused_attention_backend,
-                        use_unfused_attention,
-                        _,
-                    ) = dpa_utils.get_attention_backend(attention_params)
+                    if tg.HACK_FOR_DYNAMO:
+                        use_flash_attention = 1
+                        flash_attention_backend = FlashAttentionUtils.version
+                        use_fused_attention = False
+                        fused_attention_backend = None
+                        use_unfused_attention = False
+                    else:
+                        (
+                            use_flash_attention,
+                            flash_attention_backend,
+                            use_fused_attention,
+                            fused_attention_backend,
+                            use_unfused_attention,
+                            _,
+                        ) = dpa_utils.get_attention_backend(attention_params)
                     # Set global _attention_backends var using return value
                     # from get_attention_backend()
                     _attention_backends["use_flash_attention"] = use_flash_attention

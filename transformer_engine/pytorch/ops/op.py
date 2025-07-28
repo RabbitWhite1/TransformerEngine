@@ -22,6 +22,9 @@ from ..fp8 import (
 from ..tensor import Quantizer
 
 
+import torchgraph as tg
+
+
 @dataclasses.dataclass
 class OperationContext:
     """State needed to apply an operation
@@ -185,6 +188,10 @@ class BasicOperation(FusibleOperation, metaclass=abc.ABCMeta):
         recipe = FP8GlobalStateManager.get_fp8_recipe() if with_fp8_parameters else None
         self.reset_recipe_state(recipe=recipe)
 
+        from .fuser import OperationFuser
+
+        self.fused_fn = OperationFuser([self])
+
     @property
     def is_fused_op(self) -> bool:
         return False
@@ -224,6 +231,8 @@ class BasicOperation(FusibleOperation, metaclass=abc.ABCMeta):
 
         # Clear quantization state if necessary
         if recipe is None:
+            if tg.HACK_FOR_DYNAMO:
+                return
             self._fp8_metas = None
             self._quantizers = None
             return
@@ -491,14 +500,17 @@ class BasicOperation(FusibleOperation, metaclass=abc.ABCMeta):
         *extra_inputs: torch.Tensor,
         **kwargs: Any,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
-        """Apply operation"""
-        from .fuser import OperationFuser
+        if tg.HACK_FOR_DYNAMO:
+            return self.fused_fn(input, *extra_inputs, basic_op_kwargs=[kwargs])
+        else:
+            """Apply operation"""
+            from .fuser import OperationFuser
 
-        return OperationFuser([self])(
-            input,
-            *extra_inputs,
-            basic_op_kwargs=[kwargs],
-        )
+            return OperationFuser([self])(
+                input,
+                *extra_inputs,
+                basic_op_kwargs=[kwargs],
+            )
 
     def get_extra_state(self) -> torch.Tensor:
         """Serialize extra state

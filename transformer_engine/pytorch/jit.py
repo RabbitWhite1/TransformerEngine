@@ -12,6 +12,9 @@ from . import torch_version
 from .export import is_in_onnx_export_mode
 from .utils import gpu_autocast_ctx
 
+
+import torchgraph as tg
+
 # pylint: disable=unnecessary-lambda-assignment
 
 
@@ -34,13 +37,13 @@ def lazy_compile(func):
 
 
 jit_fuser = lambda func: func
-if torch_version() >= (2, 0, 0) and bool(int(os.getenv("NVTE_TORCH_COMPILE", "1"))):
+if not tg.HACK_FOR_DYNAMO and torch_version() >= (2, 0, 0) and bool(int(os.getenv("NVTE_TORCH_COMPILE", "1"))):
     jit_fuser = lazy_compile
 
 
 # See: https://github.com/NVIDIA/TransformerEngine/issues/597
 dropout_fuser = torch.jit.script
-if torch_version() >= (2, 2, 0) and bool(int(os.getenv("NVTE_TORCH_COMPILE", "1"))):
+if not tg.HACK_FOR_DYNAMO and torch_version() >= (2, 2, 0) and bool(int(os.getenv("NVTE_TORCH_COMPILE", "1"))):
     dropout_fuser = lazy_compile
 
 

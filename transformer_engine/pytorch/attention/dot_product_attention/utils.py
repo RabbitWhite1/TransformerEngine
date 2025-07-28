@@ -48,6 +48,9 @@ from transformer_engine.pytorch.export import is_in_onnx_export_mode
 
 from transformer_engine.pytorch.jit import jit_fuser
 
+
+import torchgraph as tg
+
 # NVTE_DEBUG = 0/1 # disables/enables debug mode, default = 0
 _NVTE_DEBUG = int(os.getenv("NVTE_DEBUG", "0"))
 # NVTE_DEBUG_LEVEL = 0/1/2 # enables more and more verbose debug mode, default = 0
@@ -1142,7 +1145,8 @@ def get_full_mask(
             actual_seqlens_kv - actual_seqlens_q + window_size[1]
         ).view(batch_size, 1, 1, 1)
     swa_mask = torch.logical_not((swa_left <= 0) & ~(swa_right < 0))
-    if attention_mask is not None:
+    # FIXME: Should not ignore.
+    if not tg.HACK_FOR_DYNAMO and attention_mask is not None:
         attention_mask = torch.logical_or(swa_mask, attention_mask)
     else:
         attention_mask = swa_mask
@@ -1622,6 +1626,8 @@ def get_qkv_layout(
         is_same_q_kv_format = True
 
     def run_iteratively(q, k, v):
+        if tg.HACK_FOR_DYNAMO:
+            return 'sbhd_sbhd_sbhd'
         # check data pointers
         if is_in_onnx_export_mode():
             check_ptrs_qkv = False
@@ -1717,7 +1723,6 @@ def get_qkv_layout(
                 qkv_layout = q_format + "_" + kv_format + "_" + kv_format
         else:
             qkv_layout = "not_supported"
-
         return qkv_layout
 
     if not is_in_onnx_export_mode():

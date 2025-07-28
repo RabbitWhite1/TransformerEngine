@@ -53,6 +53,7 @@ def torch_onnx_gemm_inf_op(
     weight: torch.Tensor, inp: torch.Tensor, bias: torch.Tensor
 ) -> torch.Tensor:
     """Gemm used for inference -- weight is transposed"""
+    raise RuntimeError("!!!")
     out = inp @ weight.T
     if bias is not None:
         out = out + bias
@@ -66,6 +67,24 @@ def _(weight, inp, bias):
     if bias is not None:
         out = out + bias
     return out
+
+
+def setup_context(ctx, inputs, output):
+    """Setup context for ONNX GEMM used for inference."""
+    weight, inp, bias = inputs[0], inputs[1], inputs[2]
+    ctx.save_for_backward(weight, inp, bias)
+
+
+def backward(ctx, grad_output):
+    """Backward pass for ONNX GEMM used for inference."""
+    weight, inp, bias = ctx.saved_tensors
+    grad_weight = grad_output.T @ inp
+    grad_inp = grad_output @ weight
+    grad_bias = grad_output.sum(dim=0) if bias is not None else None
+    return grad_weight, grad_inp, grad_bias
+
+
+torch_onnx_gemm_inf_op.register_autograd(backward, setup_context=setup_context)
 
 
 def onnx_gemm_inf_symbolic(
